@@ -82,6 +82,9 @@ MODULE_REGISTRY = {
     "url": "UrlModule",
     "leak": "LeakModule",
     "vuln": "VulnModule",
+    "wifi": "WifiScanModule",
+    "lan": "LanDiscoveryModule",
+    "macvendor": "MacVendorModule",
 }
 
 logger = logging.getLogger("AndroPOT")
@@ -108,6 +111,9 @@ class ReconState:
             "api_endpoints": [],
             "vulns": [],
             "leaks": [],
+            "wifi_networks": [],
+            "wifi_connection": {},
+            "lan_devices": [],
             "errors": [],
         }
         os.makedirs(output_dir, exist_ok=True)
@@ -525,6 +531,223 @@ class VulnModule(BaseModule):
         logger.info("[vuln] %d findings", self.state.count("vulns"))
 
 
+
+# --------------------------------------------------------------------------
+# WiFi / LAN modules (Android-friendly, no root required)
+# --------------------------------------------------------------------------
+
+class WifiScanModule(BaseModule):
+    """Scan nearby WiFi networks via Termux API."""
+    name = "wifi"
+
+    def run(self):
+        out = self.state.output_dir
+        result = self.runner.run("termux-wifi-scaninfo 2>/dev/null")
+        networks = []
+        try:
+            data = json.loads(result) if result.strip().startswith("[") else []
+        except json.JSONDecodeError:
+            data = []
+        if isinstance(data, dict) and "error" in data:
+            logger.warning("[wifi] %s", data["error"])
+            data = []
+        for net in data:
+            ssid = net.get("ssid", "<hidden>")
+            bssid = net.get("bssid", "")
+            rssi = net.get("level", 0)
+            freq = net.get("frequency", 0)
+            caps = net.get("capabilities", "")
+            # Estimate channel from frequency
+            channel = ""
+            if freq:
+                if freq < 3000:
+                    channel = str((freq - 2412) // 5 + 1) if freq >= 2412 else ""
+                else:
+                    channel = str((freq - 5180) // 5 + 36) if freq >= 5180 else ""
+            networks.append({
+                "ssid": ssid,
+                "bssid": bssid,
+                "signal": rssi,
+                "freq": freq,
+                "channel": channel,
+                "security": caps,
+            })
+        self.state.data.setdefault("wifi_networks", [])
+        self.state.data["wifi_networks"] = networks
+        # Also store as simple list for state counts
+        self.state.add("wifi_networks_simple", [f"{n['ssid']} ({n['bssid']}) {n['signal']}dBm ch{n['channel']}" for n in networks])
+        self.runner.write_lines(os.path.join(out, "wifi_networks.txt"),
+                               [f"{n['ssid']}|{n['bssid']}|{n['signal']}|{n['channel']}|{n['security']}" for n in networks])
+        logger.info("[wifi] %d networks found", len(networks))
+
+        # Current connection info
+        conn = self.runner.run("termux-wifi-connectioninfo 2>/dev/null")
+        try:
+            cdata = json.loads(conn) if conn.strip().startswith("{") else {}
+        except json.JSONDecodeError:
+            cdata = {}
+        if cdata and "error" not in cdata:
+            self.state.data["wifi_connection"] = cdata
+            logger.info("[wifi] connected to: %s (%s)", cdata.get("ssid", "?"), cdata.get("ip", "?"))
+
+
+class LanDiscoveryModule(BaseModule):
+    """Discover devices on the local network via ARP + ping sweep."""
+    name = "lan"
+    requires = ()
+
+    def run(self):
+        out = self.state.output_dir
+        devices = []
+
+        # 1. Read existing ARP table
+        arp_output = self.runner.run("arp -a 2>/dev/null || cat /proc/net/arp 2>/dev/null")
+        seen_ips = set()
+        for line in arp_output.splitlines():
+            parts = line.split()
+            # /proc/net/arp format: IP HW_TYPE Flags HW_ADDR Mask Device
+            if len(parts) >= 4 and "." in parts[0]:
+                ip = parts[0]
+                mac = parts[3] if len(parts) > 3 else ""
+                if ip not in seen_ips and mac and mac != "00:00:00:00:00:00":
+                    seen_ips.add(ip)
+                    devices.append({"ip": ip, "mac": mac, "source": "arp"})
+            # arp -a format: hostname (ip) at mac on iface
+            elif "(" in line and "at" in line:
+                try:
+                    ip = line.split("(")[1].split(")")[0]
+                    mac = line.split("at ")[1].split()[0]
+                    if ip not in seen_ips and mac and mac != "00:00:00:00:00:00":
+                        seen_ips.add(ip)
+                        devices.append({"ip": ip, "mac": mac, "source": "arp"})
+                except (IndexError, ValueError):
+                    pass
+
+        # 2. Determine local IP (from wifi_connection or hostname)
+        conn_info = self.state.data.get("wifi_connection", {})
+        ip = conn_info.get("ip", "")
+        if not ip or "." not in ip:
+            # Fallback: use hostname -I (pick first private IPv4)
+            hostout = self.runner.run("hostname -I 2>/dev/null")
+            privates = []
+            for candidate in hostout.split():
+                candidate = candidate.strip()
+                if "." in candidate and not candidate.startswith("127.") and ":" not in candidate:
+                    if candidate.startswith(("192.168.", "10.", "172.")):
+                        privates.append(candidate)
+            # Prefer 192.168.x.x, then 10.x, then 172.x
+            for prefix in ("192.168.", "10.", "172."):
+                for p in privates:
+                    if p.startswith(prefix):
+                        ip = p
+                        break
+                if ip:
+                    break
+            if not ip or "." not in ip:
+                for candidate in hostout.split():
+                    candidate = candidate.strip()
+                    if "." in candidate and not candidate.startswith("127.") and ":" not in candidate:
+                        ip = candidate
+                        break
+
+        # 3. Ping sweep on local subnet (parallel, track responses)
+        if ip and "." in ip:
+            ip = ip.strip().split()[0]
+            subnet = ".".join(ip.split(".")[:3])
+            logger.info("[lan] ping sweep %s.0/24 (parallel, no ARP in proot)", subnet)
+            targets = [f"{subnet}.{i}" for i in range(1, 255)]
+
+            alive = set()
+
+            def _ping(t):
+                try:
+                    r = subprocess.run(["ping", "-c", "1", "-W", "1", t],
+                                       capture_output=True, timeout=2)
+                    if r.returncode == 0:
+                        alive.add(t)
+                except Exception:
+                    pass
+
+            with ThreadPoolExecutor(max_workers=64) as pool:
+                list(pool.map(_ping, targets))
+
+            for a in sorted(alive, key=lambda x: [int(p) for p in x.split(".")]):
+                if a not in seen_ips:
+                    seen_ips.add(a)
+                    devices.append({"ip": a, "mac": "unknown (no ARP in proot)", "source": "ping"})
+
+        # 4. MAC vendor (will be empty without ARP, but try online for any MACs we have)
+        for dev in devices:
+            if not dev.get("vendor"):
+                dev["vendor"] = _mac_vendor(dev.get("mac", ""))
+
+        self.state.data["lan_devices"] = devices
+        self.state.add("lan_devices_simple", [f"{d['ip']} ({d['mac']}) {d.get('vendor','')}" for d in devices])
+        self.runner.write_lines(os.path.join(out, "lan_devices.txt"),
+                               [f"{d['ip']}|{d['mac']}|{d.get('vendor','')}|{d.get('source','')}" for d in devices])
+        logger.info("[lan] %d devices discovered", len(devices))
+
+
+class MacVendorModule(BaseModule):
+    """Look up MAC vendor for discovered devices via external OUI API."""
+    name = "macvendor"
+    requires = ("lan_devices",)
+
+    def run(self):
+        devices = self.state.data.get("lan_devices", [])
+        updated = 0
+        for dev in devices:
+            mac = dev.get("mac", "")
+            if not mac or dev.get("vendor"):
+                continue
+            vendor = _mac_vendor_online(mac)
+            if vendor:
+                dev["vendor"] = vendor
+                updated += 1
+        self.state.data["lan_devices"] = devices
+        logger.info("[macvendor] updated %d vendors via online lookup", updated)
+
+
+def _mac_vendor(mac):
+    """Offline MAC vendor lookup using built-in OUI prefixes."""
+    if not mac:
+        return ""
+    prefix = mac.upper().replace(":", "").replace("-", "")[:6]
+    # Small built-in OUI table for common vendors
+    OUI = {
+        "000C29": "VMware", "005056": "VMware", "080027": "VirtualBox",
+        "001A11": "Google", "F4F5D8": "Google", "546009": "Google",
+        "0017F2": "Apple", "002500": "Apple", "A4D1D2": "Apple",
+        "000F66": "Huawei", "00E0FC": "Huawei", "283152": "Huawei",
+        "001E58": "D-Link", "00265A": "D-Link", "1C7EE5": "D-Link",
+        "0014BF": "Linksys", "00259C": "Linksys", "C0C1C0": "Linksys",
+        "001310": "TP-Link", "002719": "TP-Link", "50C7BF": "TP-Link",
+        "001F33": "Netgear", "00223F": "Netgear", "A021B7": "Netgear",
+        "00044B": "Nvidia", "0013D4": "Asus", "002618": "Asus",
+        "B0BE76": "Xiaomi", "28E31F": "Xiaomi", "7C1D0D": "Xiaomi",
+        "001A70": "Cisco", "002155": "Cisco", "001B54": "Cisco",
+        "001882": "Broadcom", "001018": "Broadcom",
+        "DC4427": "Raspberry Pi", "B827EB": "Raspberry Pi",
+        "000F53": "Dell", "180373": "Dell", "F8BC12": "Dell",
+    }
+    return OUI.get(prefix, "")
+
+
+def _mac_vendor_online(mac):
+    """Online MAC vendor lookup via macvendors.com API."""
+    if not mac:
+        return ""
+    try:
+        import urllib.request
+        url = f"https://api.macvendors.com/{mac}"
+        req = urllib.request.Request(url, headers={"User-Agent": "AndroPOT"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.read().decode().strip()
+    except Exception:
+        return ""
+
+
+
 MODULES = {
     "sub": SubdomainModule,
     "port": PortModule,
@@ -532,10 +755,13 @@ MODULES = {
     "url": UrlModule,
     "leak": LeakModule,
     "vuln": VulnModule,
+    "wifi": WifiScanModule,
+    "lan": LanDiscoveryModule,
+    "macvendor": MacVendorModule,
 }
 
 # Fixed execution order - later modules depend on earlier keys.
-EXECUTION_ORDER = ["sub", "port", "http", "url", "leak", "vuln"]
+EXECUTION_ORDER = ["sub", "port", "http", "url", "leak", "vuln", "wifi", "lan", "macvendor"]
 
 
 # --------------------------------------------------------------------------
@@ -643,7 +869,7 @@ def parse_args():
     parser.add_argument("-o", "--output", default=None, help="output directory")
     parser.add_argument("--deep", action="store_true", help="enable active crawling + API extraction")
     parser.add_argument("--stealth", action="store_true", help="rate-limit and rotate identities")
-    parser.add_argument("--modules", default=None, help="comma list: sub,port,http,url,leak,vuln")
+    parser.add_argument("--modules", default=None, help="comma list: sub,port,http,url,leak,vuln,wifi,lan,macvendor")
     parser.add_argument("--parallel", action="store_true", help="fan out independent modules")
     parser.add_argument("--timeout", type=int, default=300, help="per-command timeout (s)")
     parser.add_argument("--port-limit", type=int, default=DEFAULT_PORT_SCAN_LIMIT,
@@ -740,7 +966,7 @@ def main():
     run_pipeline(pipeline, state, parallel=args.parallel, resume=not args.no_resume)
 
     summary = {k: state.count(k) for k in
-               ("subdomains", "live_hosts", "open_ports", "urls", "api_endpoints", "vulns", "leaks")}
+               ("subdomains", "live_hosts", "open_ports", "urls", "api_endpoints", "vulns", "leaks", "wifi_networks_simple", "lan_devices_simple")}
     logger.info("done :: %s", json.dumps(summary))
     state.save()
 
