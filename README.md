@@ -35,6 +35,9 @@ empty reports because each tool failed in a different way. AndroPOT fixes the pl
 | `url` | waybackurls + katana | passive URL history + active crawl, API endpoint extraction |
 | `leak` | GitHub code search | public code references mentioning the domain |
 | `vuln` | nuclei | template-based vulnerability scanning |
+| `wifi` | termux-wifi-scaninfo | nearby WiFi network scan (Android) |
+| `lan` | ping sweep | local network device discovery |
+| `macvendor` | OUI database + API | MAC vendor identification |
 
 Plus:
 
@@ -99,7 +102,7 @@ python3 andropot.py -d example.com --no-analyzer
 | `-o, --output` | output directory (default `recon_results/<domain>`) |
 | `--deep` | active crawling and API endpoint extraction |
 | `--stealth` | rate-limit requests and rotate identities |
-| `--modules` | comma list: `sub,port,http,url,leak,vuln` |
+| `--modules` | comma list: `sub,port,http,url,leak,vuln,wifi,lan,macvendor` |
 | `--parallel` | run independent modules concurrently |
 | `--timeout` | per-command timeout in seconds (default 300) |
 | `--log` | log file path |
@@ -154,6 +157,50 @@ Python connect scan. On a real Linux host, install `naabu` and it will be used d
 **Live hosts are zero but subdomains exist.**
 Verify the target resolves: `curl -sI https://<domain>`. A dead or firewalled target
 produces a legitimate zero.
+
+---
+
+
+## WiFi / LAN Mode (Android)
+
+AndroPOT can scan your local WiFi network and discover devices:
+
+```bash
+# Scan WiFi networks + LAN devices
+python3 andropot.py -d local --modules wifi,lan
+
+# WiFi scan only
+python3 andropot.py -d local --modules wifi
+
+# LAN discovery only
+python3 andropot.py -d local --modules lan
+
+# Full recon + WiFi/LAN
+python3 andropot.py -d example.com --deep --modules sub,http,wifi,lan
+```
+
+### WiFi Module (`wifi`)
+- Scans nearby WiFi networks (SSID, BSSID, signal, channel, security)
+- Shows current connection info (IP, SSID, signal strength)
+- Requires `termux-wifi-scaninfo` (Termux:API app + location permission)
+
+### LAN Discovery (`lan`)
+- Discovers devices on local network via parallel ping sweep
+- Works without root (no ARP access in proot)
+- Identifies live hosts by ping response
+- Automatically detects subnet from WiFi connection or hostname
+
+### MAC Vendor (`macvendor`)
+- Looks up device manufacturer from MAC address
+- Offline: built-in OUI table (20+ vendors)
+- Online: macvendors.com API (optional)
+
+### Android Permissions
+For WiFi scanning, grant location permission:
+```bash
+termux-wifi-scaninfo  # will prompt for permission
+```
+Or via Android Settings → Apps → Termux → Permissions → Location.
 
 ---
 
