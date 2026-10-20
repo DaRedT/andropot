@@ -1,0 +1,23 @@
+# Secrets and local configuration
+.env
+*.key
+*.pem
+provider-config.yaml
+config.yaml
+
+# Recon artifacts and state
+recon_results/
+*.log
+state.json
+crt_raw.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor and OS
+.DS_Store
+.idea/
+.vscode/
