@@ -485,7 +485,8 @@ class VulnModule(BaseModule):
         ua = random.choice(USER_AGENTS)
         # nuclei also takes custom headers via -H (no -ua flag in v3).
         self.runner.run_to_file(
-            f"{DEFAULT_BIN_PATH}/nuclei -l {live_path} -silent -rl {rate_limit} "
+            f"timeout 180 {DEFAULT_BIN_PATH}/nuclei -l {live_path} -silent -rl {rate_limit} "
+            f"-timeout 10 -retries 1 -max-host-error 3 "
             f"-H 'User-Agent: {ua}' -stats",
             out_path,
         )
