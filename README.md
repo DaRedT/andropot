@@ -103,6 +103,9 @@ python3 andropot.py -d example.com --no-analyzer
 | `--parallel` | run independent modules concurrently |
 | `--timeout` | per-command timeout in seconds (default 300) |
 | `--log` | log file path |
+| `--quick` | fast pass: sub+http only, small limits (Android-friendly) |
+| `--no-resume` | ignore existing state.json and start fresh |
+| `--wayback-timeout` | hard timeout for waybackurls (default 180s) |
 | `--no-analyzer` | skip report generation |
 | `-v` | debug logging |
 
