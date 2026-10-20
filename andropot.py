@@ -100,6 +100,7 @@ class ReconState:
         self.data = {
             "domain": domain,
             "started_at": datetime.now().isoformat(timespec="seconds"),
+            "completed_modules": [],
             "subdomains": [],
             "live_hosts": [],
             "open_ports": [],
@@ -136,6 +137,27 @@ class ReconState:
             json.dump(self.data, fh, indent=2)
         os.replace(tmp, path)
         return path
+
+    @classmethod
+    def load_or_create(cls, domain, output_dir):
+        path = os.path.join(output_dir, "state.json")
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                if data.get("domain") == domain:
+                    obj = cls.__new__(cls)
+                    obj.domain = domain
+                    obj.output_dir = output_dir
+                    obj.data = data
+                    obj.data.setdefault("completed_modules", [])
+                    logger.info("[resume] loaded existing state with %d completed modules: %s",
+                                len(obj.data["completed_modules"]),
+                                ", ".join(obj.data["completed_modules"]) or "none")
+                    return obj
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("[resume] could not load state (%s) - starting fresh", exc)
+        return cls(domain, output_dir)
 
 
 # --------------------------------------------------------------------------
@@ -238,7 +260,7 @@ class SubdomainModule(BaseModule):
             f"curl -s --max-time 45 'https://crt.sh/?q={target}&output=json'",
             os.path.join(out, "crt_raw.json"),
         )
-        subs.extend(self._parse_crt(os.path.join(out, "crt_raw.json")))
+        subs.extend(self._parse_crt(os.path.join(out, "crt_raw.json"), target))
 
         # The apex domain is never a "subdomain" but must be probed too.
         subs.append(target)
@@ -247,7 +269,7 @@ class SubdomainModule(BaseModule):
         logger.info("[sub] %d subdomains", self.state.count("subdomains"))
 
     @staticmethod
-    def _parse_crt(path):
+    def _parse_crt(path, target):
         """crt.sh returns a JSON array; tolerate HTML/empty fallbacks."""
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
@@ -267,7 +289,14 @@ class SubdomainModule(BaseModule):
             common = record.get("common_name") or ""
             names.update(part for part in common.split("\n") if part)
             names.update(record.get("name_value", "").split("\n"))
-        return [n.strip().lower() for n in names if n and "*" not in n]
+        filtered = []
+        for n in names:
+            n = n.strip().lower()
+            if not n or "*" in n:
+                continue
+            if n == target or n.endswith("." + target):
+                filtered.append(n)
+        return filtered
 
 
 class PortModule(BaseModule):
@@ -387,9 +416,10 @@ class UrlModule(BaseModule):
     name = "url"
     requires = ("subdomains",)
 
-    def __init__(self, state, runner, deep=False):
+    def __init__(self, state, runner, deep=False, wayback_timeout=180):
         super().__init__(state, runner)
         self.deep = deep
+        self.wayback_timeout = wayback_timeout
 
     def run(self):
         if not self.ready():
@@ -403,7 +433,7 @@ class UrlModule(BaseModule):
         self.runner.write_lines(harvest_path, targets)
 
         self.runner.run_to_file(
-            f"cat {harvest_path} | timeout 180 {DEFAULT_BIN_PATH}/waybackurls",
+            f"cat {harvest_path} | timeout {self.wayback_timeout} {DEFAULT_BIN_PATH}/waybackurls",
             os.path.join(out, "urls_passive.txt"),
         )
         if not self.runner.read_lines(os.path.join(out, "urls_passive.txt")):
@@ -512,14 +542,17 @@ EXECUTION_ORDER = ["sub", "port", "http", "url", "leak", "vuln"]
 # Pipeline
 # --------------------------------------------------------------------------
 
-def build_pipeline(selected, state, runner, deep, stealth, port_limit, http_limit, url_limit):
+def build_pipeline(selected, state, runner, deep, stealth, port_limit, http_limit, url_limit, wayback_timeout=180, quick=False):
+    if quick:
+        selected = selected or {"sub", "http"}
+        selected = selected & {"sub", "http"}
     instances = []
     for name in EXECUTION_ORDER:
         if selected and name not in selected:
             continue
         cls = MODULES[name]
         if name == "url":
-            instance = cls(state, runner, deep=deep)
+            instance = cls(state, runner, deep=deep, wayback_timeout=wayback_timeout)
             instance.limit = url_limit
             instances.append(instance)
         elif name == "vuln":
@@ -537,21 +570,30 @@ def build_pipeline(selected, state, runner, deep, stealth, port_limit, http_limi
     return instances
 
 
-def run_pipeline(instances, state, parallel=False):
+def run_pipeline(instances, state, parallel=False, resume=True):
     if not parallel:
         for module in instances:
+            if resume and module.name in state.data.get("completed_modules", []):
+                logger.info("[%s] already completed in previous run - skipping", module.name)
+                continue
             try:
                 module.run()
             except Exception as exc:  # noqa: BLE001 - a module must never kill the run
                 logger.error("[%s] crashed: %s", module.name, exc)
                 state.data["errors"].append(f"{module.name}: {exc}")
+            else:
+                state.data.setdefault("completed_modules", []).append(module.name)
             state.save()
         return
 
-    # Parallel mode: independent branches run together. `port`/`http`/`url`/`leak`
-    # only need `subdomains`, so they are safe to fan out once `sub` completes.
+    # Parallel mode
     with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {pool.submit(_guarded, module, state): module.name for module in instances}
+        futures = {}
+        for module in instances:
+            if resume and module.name in state.data.get("completed_modules", []):
+                logger.info("[%s] already completed in previous run - skipping", module.name)
+                continue
+            futures[pool.submit(_guarded, module, state)] = module.name
         for future in as_completed(futures):
             name = futures[future]
             try:
@@ -559,6 +601,8 @@ def run_pipeline(instances, state, parallel=False):
             except Exception as exc:  # noqa: BLE001
                 logger.error("[%s] crashed: %s", name, exc)
                 state.data["errors"].append(f"{name}: {exc}")
+            else:
+                state.data.setdefault("completed_modules", []).append(name)
             state.save()
 
 
@@ -609,9 +653,47 @@ def parse_args():
     parser.add_argument("--url-limit", type=int, default=DEFAULT_URL_HARVEST_LIMIT,
                         help="max hosts to harvest URLs from (default 100)")
     parser.add_argument("--log", default=DEFAULT_LOG_FILE, help="log file path")
+    parser.add_argument("--no-resume", action="store_true", help="ignore existing state.json and start fresh")
+    parser.add_argument("--quick", action="store_true", help="fast pass: sub+http only, small limits")
     parser.add_argument("--no-analyzer", action="store_true", help="skip the post-scan analyzer")
+    parser.add_argument("--wayback-timeout", type=int, default=180, help="hard timeout for waybackurls (s)")
     parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
     return parser.parse_args()
+
+
+import shutil
+
+
+def _termux_available():
+    return shutil.which("termux-wake-lock") is not None
+
+
+def _acquire_wake_lock():
+    if _termux_available():
+        try:
+            subprocess.run(["termux-wake-lock"], capture_output=True, timeout=5)
+            logger.info("[android] wake lock acquired")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("[android] wake lock failed: %s", exc)
+
+
+def _release_wake_lock():
+    if _termux_available():
+        try:
+            subprocess.run(["termux-wake-unlock"], capture_output=True, timeout=5)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _notify(title, text):
+    if shutil.which("termux-notification") is not None:
+        try:
+            subprocess.run(
+                ["termux-notification", "--title", title, "--content", text],
+                capture_output=True, timeout=5,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def main():
@@ -619,7 +701,13 @@ def main():
     setup_logging(args.log, args.verbose)
 
     output_dir = args.output or os.path.join("recon_results", args.domain)
-    state = ReconState(args.domain, output_dir)
+    os.makedirs(output_dir, exist_ok=True)
+
+    if args.no_resume:
+        state = ReconState(args.domain, output_dir)
+    else:
+        state = ReconState.load_or_create(args.domain, output_dir)
+
     runner = Runner(timeout=args.timeout)
 
     selected = {m.strip() for m in args.modules.split(",")} if args.modules else None
@@ -629,14 +717,27 @@ def main():
             logger.error("unknown modules: %s (valid: %s)", ", ".join(sorted(unknown)), ", ".join(EXECUTION_ORDER))
             sys.exit(2)
 
-    logger.info("AndroPOT :: target=%s out=%s deep=%s stealth=%s",
-                args.domain, output_dir, args.deep, args.stealth)
+    if args.quick:
+        port_limit = min(args.port_limit, 50)
+        http_limit = min(args.http_limit, 100)
+        url_limit = min(args.url_limit, 20)
+    else:
+        port_limit = args.port_limit
+        http_limit = args.http_limit
+        url_limit = args.url_limit
+
+    logger.info("AndroPOT :: target=%s out=%s deep=%s stealth=%s quick=%s resume=%s",
+                args.domain, output_dir, args.deep, args.stealth, args.quick, not args.no_resume)
+
+    _acquire_wake_lock()
+    _notify("AndroPOT", "Starting recon on " + args.domain)
 
     pipeline = build_pipeline(
         selected, state, runner, args.deep, args.stealth,
-        args.port_limit, args.http_limit, args.url_limit,
+        port_limit, http_limit, url_limit,
+        wayback_timeout=args.wayback_timeout, quick=args.quick,
     )
-    run_pipeline(pipeline, state, parallel=args.parallel)
+    run_pipeline(pipeline, state, parallel=args.parallel, resume=not args.no_resume)
 
     summary = {k: state.count(k) for k in
                ("subdomains", "live_hosts", "open_ports", "urls", "api_endpoints", "vulns", "leaks")}
@@ -644,15 +745,18 @@ def main():
     state.save()
 
     print("\n" + "=" * 62)
-    print(f"  AndroPOT recon finished :: {args.domain}")
+    print("  AndroPOT recon finished :: " + args.domain)
     print("=" * 62)
     for key, value in summary.items():
-        print(f"  {key:<14} {value}")
+        print("  {:<14} {}".format(key, value))
     if state.data["errors"]:
-        print(f"  {'errors':<14} {len(state.data['errors'])}")
-    print(f"\n  artifacts : {output_dir}/")
-    print(f"  state     : {output_dir}/state.json")
-    print(f"  log       : {args.log}")
+        print("  {:<14} {}".format("errors", len(state.data["errors"])))
+    print("\n  artifacts : " + output_dir + "/")
+    print("  state     : " + output_dir + "/state.json")
+    print("  log       : " + args.log)
+
+    _notify("AndroPOT", "Finished " + args.domain + ": " + str(summary.get("live_hosts", 0)) + " live, " + str(summary.get("vulns", 0)) + " vulns")
+    _release_wake_lock()
 
     analyzer = os.environ.get("ANDROPOT_ANALYZER", DEFAULT_ANALYZER)
     if not args.no_analyzer and os.path.exists(analyzer) and os.path.isfile(analyzer):
